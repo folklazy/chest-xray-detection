@@ -13,6 +13,8 @@ class CheXpertModel(nn.Module):
     ):
         super().__init__()
 
+        self.model_name = model_name
+
         if model_name == "densenet121":
             weights = models.DenseNet121_Weights.DEFAULT if pretrained else None
             backbone = models.densenet121(weights=weights)
@@ -28,21 +30,25 @@ class CheXpertModel(nn.Module):
             backbone = models.efficientnet_b0(weights=weights)
 
             in_f = backbone.classifier[-1].in_features
-            backbone.classifier[-1] = nn.Linear(in_f, num_classes)
+            backbone.classifier[-1] = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(in_f, num_classes)
+            )
 
         else:
-            raise ValueError("Unsupported model")
+            raise ValueError(f"Unsupported model: {model_name}")
 
         self.backbone = backbone
 
     def forward(self, x):
         return self.backbone(x)
 
-    # 🔥 optional helpers
-    def freeze_backbone(self):
-        for p in self.backbone.parameters():
-            p.requires_grad = False
+    # Freeze only feature extractor, keep head trainable
+    def freeze_features(self):
+        for name, p in self.backbone.named_parameters():
+            if "classifier" not in name:
+                p.requires_grad = False
 
-    def unfreeze_backbone(self):
+    def unfreeze_all(self):
         for p in self.backbone.parameters():
             p.requires_grad = True
