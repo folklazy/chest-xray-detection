@@ -1,132 +1,185 @@
 import os
 import cv2
+import argparse
 import numpy as np
 import torch
 import matplotlib.pyplot as plt
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
+
 from pytorch_grad_cam import GradCAM
 from pytorch_grad_cam.utils.image import show_cam_on_image
+from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
-# Import โมเดลของเรา (ต้องชื่อตรงกับไฟล์ src/model.py)
 from src.model import CheXpertLightning
 
-# ==========================================
-# ⚙️ CONFIG (แก้ตรงนี้ก่อนรัน!)
-# ==========================================
+# =====================================================
+# CONFIG
+# =====================================================
 
-# 1. Path ของไฟล์ Model ที่ดีที่สุด (ก๊อปมาจาก Log ตอนเทรนเสร็จ)
-# ตัวอย่าง: "logs/chexpert/version_2/checkpoints/best-epoch=04-val_auc=0.8023.ckpt"
-CKPT_PATH = r"logs/chexpert/version_2/checkpoints/best-epoch=04-val_auc=0.8023.ckpt" 
+CLASS_NAMES = [
+    "Atelectasis",
+    "Cardiomegaly",
+    "Consolidation",
+    "Edema",
+    "Pleural Effusion",
+]
 
-# 2. Path ของรูป X-ray ที่จะทดสอบ
-# เลือกรูปใน folder valid มาลองสักรูป
-IMG_PATH = r"data/CheXpert-v1.0-small/valid/patient64541/study1/view1_frontal.jpg"
-
-# 3. ตั้งค่า Device
+IMG_SIZE = 320
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
-# ==========================================
-# 🛠️ HELPER FUNCTIONS
-# ==========================================
+
+# =====================================================
+# Utils
+# =====================================================
 
 def load_model(ckpt_path):
-    print(f"🔄 Loading model from: {ckpt_path}")
     if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(f"❌ ไม่เจอไฟล์ Model ที่: {ckpt_path}")
-    
-    # โหลด Lightning Module
+        raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
+
     model = CheXpertLightning.load_from_checkpoint(ckpt_path)
     model.to(DEVICE)
-    model.eval() # ปิด Dropout เพื่อให้ผลนิ่ง
+    model.eval()
     return model
 
+
 def preprocess_image(img_path):
-    # ⚠️ ใช้ Grayscale เหมือนตอน Train!
     img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        raise FileNotFoundError(f"❌ ไม่เจอรูปภาพที่: {img_path}")
-    
-    # Stack เป็น 3 channels (เหมือน dataset.py)
-    img = np.stack([img]*3, axis=-1)
-    img = cv2.resize(img, (320, 320))
-    
-    # เตรียมภาพสำหรับโชว์ (Float 0-1)
-    rgb_img_float = np.float32(img) / 255.0
+        raise FileNotFoundError(f"Image not found: {img_path}")
 
-    # เตรียมภาพสำหรับเข้า Model (Normalize แบบเดียวกับตอน Train)
-    transform = A.Compose([
-        A.Resize(320, 320),
-        A.Normalize(mean=[0.485]*3, std=[0.229]*3),  # ⚠️ ตรงกับ dataset.py
+    img = np.stack([img] * 3, axis=-1)
+
+    resize_tf = A.Compose([
+        A.LongestMaxSize(max_size=IMG_SIZE),
+        A.PadIfNeeded(
+            min_height=IMG_SIZE,
+            min_width=IMG_SIZE,
+            border_mode=cv2.BORDER_CONSTANT,
+            value=0,
+        ),
+    ])
+
+    img = resize_tf(image=img)["image"]
+
+    img_float = np.float32(img) / 255.0
+
+    tensor_tf = A.Compose([
+        A.Normalize(mean=[0.485]*3, std=[0.229]*3),
         ToTensorV2()
     ])
-    
-    # Albumentations ต้องการ input เป็น key-value
-    tensor = transform(image=img)["image"]
-    tensor = tensor.unsqueeze(0).to(DEVICE) # เพิ่ม Batch dimension -> [1, 3, 320, 320]
-    
-    return rgb_img_float, tensor
 
-def predict_and_visualize(model, rgb_img_float, input_tensor):
-    # 1. Prediction
+    tensor = tensor_tf(image=img)["image"].unsqueeze(0).to(DEVICE)
+
+    return img_float, tensor
+
+
+def predict(model, tensor):
     with torch.no_grad():
-        logits = model(input_tensor)
-        probs = torch.sigmoid(logits).cpu().numpy()[0] # แปลงเป็น % (0-1)
-    
-    class_names = ['Atelectasis', 'Cardiomegaly', 'Consolidation', 'Edema', 'Pleural Effusion']
-    
-    print("\n📊 --- Prediction Results ---")
-    for i, name in enumerate(class_names):
-        score = probs[i]
-        bar = "█" * int(score * 20)
-        print(f"{name:<20}: {score:.4f}  {bar}")
+        logits = model(tensor)
+        probs = torch.sigmoid(logits).cpu().numpy()[0]
+    return probs
 
-    # 2. Grad-CAM (XAI)
-    # เจาะเข้าไปที่ Layer สุดท้ายของ CNN (สำหรับ DenseNet121 คือ features[-1])
-    target_layers = [model.model.backbone.features[-1]]
-    
-    cam = GradCAM(model=model, target_layers=target_layers)
-    
-    # สร้าง Heatmap
-    # targets=None หมายถึงให้โฟกัสที่ Class ที่โมเดลมั่นใจที่สุด
-    grayscale_cam = cam(input_tensor=input_tensor, targets=None)
-    
-    # เอา Heatmap มาแปะทับรูปเดิม
-    grayscale_cam = grayscale_cam[0, :]
-    visualization = show_cam_on_image(rgb_img_float, grayscale_cam, use_rgb=True)
 
-    # 3. Plot รูป
-    plt.figure(figsize=(12, 6))
-    
-    # รูปซ้าย: ต้นฉบับ
-    plt.subplot(1, 2, 1)
-    plt.imshow(rgb_img_float)
-    plt.title("Original X-ray")
-    plt.axis("off")
-    
-    # รูปขวา: XAI Heatmap
-    plt.subplot(1, 2, 2)
-    plt.imshow(visualization)
-    plt.title("AI Attention (Grad-CAM)")
-    plt.axis("off")
-    
-    plt.tight_layout()
-    plt.show()
+def run_gradcam(model, tensor, rgb_img_float, class_idx):
+    # DenseNet121: ใช้ denseblock4 จะคมและเสถียรสุด
+    target_layers = [model.model.backbone.features.denseblock4]
+    targets = [ClassifierOutputTarget(class_idx)]
 
-# ==========================================
-# 🚀 MAIN
-# ==========================================
+    cam = GradCAM(
+        model=model,
+        target_layers=target_layers,
+        use_cuda=(DEVICE == "cuda"),
+    )
+
+    grayscale_cam = cam(input_tensor=tensor, targets=targets)[0]
+    visualization = show_cam_on_image(
+        rgb_img_float, grayscale_cam, use_rgb=True
+    )
+
+    return visualization
+
+
+def visualize_and_save(
+    rgb_img,
+    cams,
+    probs,
+    output_dir,
+    img_name,
+):
+    os.makedirs(output_dir, exist_ok=True)
+
+    for name, cam_img in cams.items():
+        plt.figure(figsize=(6, 6))
+        plt.imshow(cam_img)
+        plt.title(f"{name} | prob={probs[CLASS_NAMES.index(name)]:.3f}")
+        plt.axis("off")
+
+        save_path = os.path.join(
+            output_dir, f"{img_name}_cam_{name.replace(' ', '_')}.png"
+        )
+        plt.savefig(save_path, bbox_inches="tight", dpi=200)
+        plt.close()
+
+        print(f"✅ Saved: {save_path}")
+
+
+# =====================================================
+# MAIN
+# =====================================================
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--ckpt", required=True, help="Path to .ckpt")
+    parser.add_argument("--img", required=True, help="Path to X-ray image")
+    parser.add_argument(
+        "--mode",
+        default="topk",
+        choices=["topk", "single"],
+        help="topk = top-2 classes, single = specific class",
+    )
+    parser.add_argument(
+        "--class_name",
+        default="Consolidation",
+        help="Used when mode=single",
+    )
+    parser.add_argument(
+        "--output",
+        default="outputs",
+        help="Folder to save CAM images",
+    )
+    args = parser.parse_args()
+
+    model = load_model(args.ckpt)
+    rgb_img, tensor = preprocess_image(args.img)
+    probs = predict(model, tensor)
+
+    print("\n📊 Prediction Results")
+    for i, name in enumerate(CLASS_NAMES):
+        bar = "█" * int(probs[i] * 20)
+        print(f"{name:<20}: {probs[i]:.4f} {bar}")
+
+    cams = {}
+
+    if args.mode == "single":
+        if args.class_name not in CLASS_NAMES:
+            raise ValueError(f"Unknown class: {args.class_name}")
+        idx = CLASS_NAMES.index(args.class_name)
+        cams[args.class_name] = run_gradcam(
+            model, tensor, rgb_img, idx
+        )
+
+    else:  # topk
+        topk = np.argsort(probs)[::-1][:2]
+        for idx in topk:
+            name = CLASS_NAMES[idx]
+            cams[name] = run_gradcam(
+                model, tensor, rgb_img, idx
+            )
+
+    img_name = os.path.splitext(os.path.basename(args.img))[0]
+    visualize_and_save(rgb_img, cams, probs, args.output, img_name)
+
+
 if __name__ == "__main__":
-    try:
-        # 1. โหลดโมเดล
-        model = load_model(CKPT_PATH)
-        
-        # 2. เตรียมรูป
-        rgb_img, tensor = preprocess_image(IMG_PATH)
-        
-        # 3. ทำนายและโชว์ผล
-        predict_and_visualize(model, rgb_img, tensor)
-        
-    except Exception as e:
-        print(f"\n❌ Error: {e}")
-        print("คำแนะนำ: ตรวจสอบ CKPT_PATH และ IMG_PATH ให้ถูกต้องครับ")
+    main()

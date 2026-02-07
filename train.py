@@ -38,7 +38,7 @@ def main():
     pl.seed_everything(42, workers=True)
 
     # -----------------------------
-    # DataModule
+    # DataModule (🔥 Stanford Policy)
     # -----------------------------
     dm = CheXpertDataModule(
         data_dir=DATA_DIR,
@@ -46,6 +46,7 @@ def main():
         img_size=IMG_SIZE,
         batch_size=BATCH_SIZE,
         num_workers=NUM_WORKERS,
+        policy="custom",  # 🔥 Custom per-class policy with U-Ignore
     )
 
     # -----------------------------
