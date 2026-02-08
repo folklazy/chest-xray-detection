@@ -18,12 +18,12 @@ from src.model import CheXpertLightning
 DATA_DIR = "./data"  # โฟลเดอร์ที่มี CheXpert-v1.0-small
 CSV_PATH = "./data/CheXpert-v1.0-small/train.csv"
 
-IMG_SIZE = 320
-BATCH_SIZE = 16
+IMG_SIZE = 384  # ✅ เพิ่มจาก 320 → ช่วย Atelectasis/Consolidation
+BATCH_SIZE = 12  # ✅ ลดจาก 16 → VRAM ไหว
 NUM_WORKERS = 4
 
-MODEL_NAME = "densenet121"  # or efficientnet-b0
-LR = 1e-4
+MODEL_NAME = "convnext_tiny"  # densenet121, efficientnet-b0, convnext_tiny
+LR = 3e-4  # ConvNeXt ชอบ LR สูงกว่า DenseNet
 EPOCHS = 15
 
 # จากที่คุณคำนวณมา
@@ -36,6 +36,9 @@ POS_WEIGHT = [5.68, 7.29, 14.01, 3.28, 1.59]
 
 def main():
     pl.seed_everything(42, workers=True)
+
+    # ✅ RTX 4070: เปิด Tensor Cores ให้เร็วขึ้น
+    torch.set_float32_matmul_precision("medium")
 
     # -----------------------------
     # DataModule (🔥 Stanford Policy)

@@ -1,6 +1,29 @@
+# =====================================================
+# CheXpert Backbone Models
+# =====================================================
+#
+# Supported Models:
+# -----------------
+# torchvision:
+#   - densenet121
+#   - efficientnet-b0
+#   - convnext_tiny
+#
+# timm (if installed):
+#   - Any timm model name (e.g., convnextv2_tiny, efficientnetv2_s)
+#
+# =====================================================
+
 import torch
 import torch.nn as nn
 from torchvision import models
+
+# Check if timm is available
+try:
+    import timm
+    TIMM_AVAILABLE = True
+except ImportError:
+    TIMM_AVAILABLE = False
 
 
 class CheXpertModel(nn.Module):
@@ -15,6 +38,9 @@ class CheXpertModel(nn.Module):
 
         self.model_name = model_name
 
+        # =====================
+        # torchvision models
+        # =====================
         if model_name == "densenet121":
             weights = models.DenseNet121_Weights.DEFAULT if pretrained else None
             backbone = models.densenet121(weights=weights)
@@ -35,8 +61,32 @@ class CheXpertModel(nn.Module):
                 nn.Linear(in_f, num_classes)
             )
 
+        elif model_name == "convnext_tiny":
+            weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
+            backbone = models.convnext_tiny(weights=weights)
+
+            in_f = backbone.classifier[-1].in_features
+            backbone.classifier[-1] = nn.Sequential(
+                nn.Dropout(dropout),
+                nn.Linear(in_f, num_classes)
+            )
+
+        # =====================
+        # timm models (fallback)
+        # =====================
+        elif TIMM_AVAILABLE:
+            # Use timm for any other model name
+            backbone = timm.create_model(
+                model_name,
+                pretrained=pretrained,
+                num_classes=num_classes,
+                drop_rate=dropout,
+            )
         else:
-            raise ValueError(f"Unsupported model: {model_name}")
+            raise ValueError(
+                f"Unsupported model: {model_name}. "
+                f"Install timm for more options: pip install timm"
+            )
 
         self.backbone = backbone
 
@@ -46,7 +96,7 @@ class CheXpertModel(nn.Module):
     # Freeze only feature extractor, keep head trainable
     def freeze_features(self):
         for name, p in self.backbone.named_parameters():
-            if "classifier" not in name:
+            if "classifier" not in name and "head" not in name and "fc" not in name:
                 p.requires_grad = False
 
     def unfreeze_all(self):

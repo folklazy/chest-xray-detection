@@ -1,3 +1,19 @@
+# =====================================================
+# CheXpert Dataset & DataModule
+# =====================================================
+#
+# Uncertainty Policy (Custom):
+# ----------------------------
+# | Disease          | Policy   | -1 →  |
+# |------------------|----------|-------|
+# | Atelectasis      | U-Ones   | 1     |
+# | Cardiomegaly     | U-Zeros  | 0     |
+# | Consolidation    | U-Ignore | -1    | (masked in loss/AUC)
+# | Edema            | U-Ones   | 1     |
+# | Pleural Effusion | U-Ones   | 1     |
+#
+# =====================================================
+
 import os
 import cv2
 import numpy as np
@@ -19,10 +35,11 @@ TARGET_COLS = [
 
 
 class CheXpertDataset(Dataset):
-    def __init__(self, df, root_dir, transform=None):
+    def __init__(self, df, root_dir, transform=None, img_size=384):
         self.df = df.reset_index(drop=True)
         self.root_dir = root_dir
         self.transform = transform
+        self.img_size = img_size
 
         self.paths = self.df["Path"].values
         self.labels = self.df[TARGET_COLS].values.astype(np.float32)
@@ -34,13 +51,12 @@ class CheXpertDataset(Dataset):
         rel_path = self.paths[idx]
         img_path = os.path.join(self.root_dir, rel_path)
 
-        # Read grayscale
         image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
             # กัน training crash ถ้า path ผิด/ไฟล์หาย
-            image = np.zeros((320, 320), dtype=np.uint8)
+            image = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
 
-        # Convert 1ch -> 3ch (สำหรับ ImageNet pretrained)
+        # 1ch -> 3ch (ใช้ pretrained ImageNet)
         image = np.stack([image] * 3, axis=-1)
 
         if self.transform:
@@ -55,11 +71,12 @@ class CheXpertDataModule(pl.LightningDataModule):
         self,
         data_dir,
         csv_path,
-        img_size=320,
+        img_size=384,
         batch_size=32,
         num_workers=4,
-        policy="u-zeros",  # u-zeros | u-ones | custom
+        policy="custom",  # u-zeros | u-ones | custom
         seed=42,
+        frontal_only=True,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -69,9 +86,14 @@ class CheXpertDataModule(pl.LightningDataModule):
         self.num_workers = num_workers
         self.policy = policy
         self.seed = seed
+        self.frontal_only = frontal_only
 
     def setup(self, stage=None):
         df = pd.read_csv(self.csv_path)
+
+        # Optional: use only Frontal views (stabilizes training)
+        if self.frontal_only and "Frontal/Lateral" in df.columns:
+            df = df[df["Frontal/Lateral"] == "Frontal"].copy()
 
         # Fill NaN with 0
         df[TARGET_COLS] = df[TARGET_COLS].fillna(0)
@@ -80,18 +102,20 @@ class CheXpertDataModule(pl.LightningDataModule):
         # Uncertainty policy (-1)
         # ----------------------------
         if self.policy == "custom":
-            # Recommended hybrid:
-            # - Atelectasis, Cardiomegaly: U-Zeros (-1 -> 0)
-            # - Consolidation: U-Ignore (keep -1 for masking in loss/metric)
-            # - Edema, Pleural Effusion: U-Ones (-1 -> 1)
-            u_zeros_cols = ["Atelectasis", "Cardiomegaly"]
-            u_ones_cols = ["Edema", "Pleural Effusion"]
+            # Paper-aligned practical hybrid:
+            # Atelectasis: U-Ones
+            # Cardiomegaly: U-Zeros
+            # Consolidation: U-Ignore (keep -1)
+            # Edema: U-Ones
+            # Pleural Effusion: U-Ones
+            u_zeros_cols = ["Cardiomegaly"]
+            u_ones_cols = ["Atelectasis", "Edema", "Pleural Effusion"]
 
             for col in u_zeros_cols:
                 df[col] = df[col].replace(-1, 0)
             for col in u_ones_cols:
                 df[col] = df[col].replace(-1, 1)
-            # Consolidation stays -1 (ignored by mask)
+            # Consolidation stays -1
 
         elif self.policy == "u-zeros":
             df[TARGET_COLS] = df[TARGET_COLS].replace(-1, 0)
@@ -103,9 +127,7 @@ class CheXpertDataModule(pl.LightningDataModule):
             raise ValueError(f"Unknown policy: {self.policy}")
 
         # ----------------------------
-        # Patient-level split (สำคัญสุด)
-        # Path format: CheXpert-v1.0-small/train/patient00001/study1/view1_frontal.jpg
-        # patient id = patient00001
+        # Patient-level split
         # ----------------------------
         df["Patient"] = df["Path"].apply(lambda x: x.split("/")[2])
 
@@ -127,10 +149,10 @@ class CheXpertDataModule(pl.LightningDataModule):
                     min_height=self.img_size,
                     min_width=self.img_size,
                     border_mode=cv2.BORDER_CONSTANT,
-                    value=0,
+                    fill=0,
                 ),
                 A.HorizontalFlip(p=0.5),
-                A.Rotate(limit=5, p=0.3),
+                A.Rotate(limit=3, p=0.1),  # ลดความแรงลง
                 A.Normalize(mean=[0.485] * 3, std=[0.229] * 3),
                 ToTensorV2(),
             ]
@@ -143,15 +165,17 @@ class CheXpertDataModule(pl.LightningDataModule):
                     min_height=self.img_size,
                     min_width=self.img_size,
                     border_mode=cv2.BORDER_CONSTANT,
-                    value=0,
+                    fill=0,
                 ),
                 A.Normalize(mean=[0.485] * 3, std=[0.229] * 3),
                 ToTensorV2(),
             ]
         )
 
-        self.train_ds = CheXpertDataset(train_df, self.data_dir, train_tf)
-        self.val_ds = CheXpertDataset(val_df, self.data_dir, val_tf)
+        self.train_ds = CheXpertDataset(train_df, self.data_dir, train_tf, img_size=self.img_size)
+        self.val_ds = CheXpertDataset(val_df, self.data_dir, val_tf, img_size=self.img_size)
+
+        print(f"📊 Dataset: Train={len(self.train_ds)}, Val={len(self.val_ds)}")
 
     def train_dataloader(self):
         return DataLoader(
