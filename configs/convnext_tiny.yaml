@@ -1,0 +1,15 @@
+# ConvNeXt-Tiny (ImageNet)
+inherits: "configs/base.yaml"
+
+model:
+  name: "convnext_tiny"
+  pretrained: true
+  dropout: 0.2
+
+data:
+  img_size: 384
+  batch_size: 12
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4

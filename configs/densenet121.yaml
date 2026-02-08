@@ -1,0 +1,15 @@
+# DenseNet121 (ImageNet) — classic baseline
+inherits: "configs/base.yaml"
+
+model:
+  name: "densenet121"
+  pretrained: true
+  dropout: 0.3
+
+data:
+  img_size: 384
+  batch_size: 16
+
+optim:
+  lr: 1.5e-4
+  weight_decay: 1.0e-4

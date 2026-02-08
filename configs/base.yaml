@@ -1,0 +1,35 @@
+# Common defaults for all experiments
+seed: 42
+
+data:
+  data_dir: "./data"
+  csv_path: "./data/CheXpert-v1.0-small/train.csv"
+  policy: "custom"          # your hybrid policy (Atelectasis U-Ones, etc.)
+  img_size: 384
+  batch_size: 12
+  num_workers: 4
+  frontal_only: true        # if you added this option in dataset.py
+
+train:
+  epochs: 8                 # phase-1 quick run
+  precision: "16-mixed"
+  accumulate_grad_batches: 2
+  gradient_clip_val: 1.0
+  log_every_n_steps: 20
+
+optim:
+  lr: 3.0e-4
+  weight_decay: 1.0e-4
+  scheduler:
+    name: "plateau"
+    monitor: "val_auc"
+    mode: "max"
+    factor: 0.1
+    patience: 2
+
+loss:
+  pos_weight: [5.68, 7.29, 14.01, 3.28, 1.59]
+
+logger:
+  save_dir: "logs"
+  name: "chexpert_phase1"

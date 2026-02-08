@@ -1,0 +1,15 @@
+# EfficientNet-B3 (ImageNet) — sweet spot ~300
+inherits: "configs/base.yaml"
+
+model:
+  name: "efficientnet_b3"
+  pretrained: true
+  dropout: 0.2
+
+data:
+  img_size: 300
+  batch_size: 16
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 1.0e-4

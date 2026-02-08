@@ -1,0 +1,15 @@
+# Swin-Tiny (ImageNet) — start with 224 for speed/stability
+inherits: "configs/base.yaml"
+
+model:
+  name: "swin_tiny"
+  pretrained: true
+  dropout: 0.2
+
+data:
+  img_size: 224
+  batch_size: 24
+
+optim:
+  lr: 2.0e-4
+  weight_decay: 5.0e-2

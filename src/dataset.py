@@ -25,13 +25,7 @@ from sklearn.model_selection import train_test_split
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
-TARGET_COLS = [
-    "Atelectasis",
-    "Cardiomegaly",
-    "Consolidation",
-    "Edema",
-    "Pleural Effusion",
-]
+from src.constants import TARGET_COLS, IMAGENET_MEAN, IMAGENET_STD
 
 
 class CheXpertDataset(Dataset):
@@ -102,20 +96,14 @@ class CheXpertDataModule(pl.LightningDataModule):
         # Uncertainty policy (-1)
         # ----------------------------
         if self.policy == "custom":
-            # Paper-aligned practical hybrid:
-            # Atelectasis: U-Ones
-            # Cardiomegaly: U-Zeros
-            # Consolidation: U-Ignore (keep -1)
-            # Edema: U-Ones
-            # Pleural Effusion: U-Ones
             u_zeros_cols = ["Cardiomegaly"]
             u_ones_cols = ["Atelectasis", "Edema", "Pleural Effusion"]
+            # Consolidation stays -1
 
             for col in u_zeros_cols:
                 df[col] = df[col].replace(-1, 0)
             for col in u_ones_cols:
                 df[col] = df[col].replace(-1, 1)
-            # Consolidation stays -1
 
         elif self.policy == "u-zeros":
             df[TARGET_COLS] = df[TARGET_COLS].replace(-1, 0)
@@ -129,6 +117,7 @@ class CheXpertDataModule(pl.LightningDataModule):
         # ----------------------------
         # Patient-level split
         # ----------------------------
+        # Path format: CheXpert-v1.0-small/train/patient00001/study1/view1_frontal.jpg
         df["Patient"] = df["Path"].apply(lambda x: x.split("/")[2])
 
         patients = df["Patient"].unique()
@@ -152,8 +141,8 @@ class CheXpertDataModule(pl.LightningDataModule):
                     fill=0,
                 ),
                 A.HorizontalFlip(p=0.5),
-                A.Rotate(limit=3, p=0.1),  # ลดความแรงลง
-                A.Normalize(mean=[0.485] * 3, std=[0.229] * 3),
+                A.Rotate(limit=3, p=0.1),
+                A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
                 ToTensorV2(),
             ]
         )
@@ -167,13 +156,17 @@ class CheXpertDataModule(pl.LightningDataModule):
                     border_mode=cv2.BORDER_CONSTANT,
                     fill=0,
                 ),
-                A.Normalize(mean=[0.485] * 3, std=[0.229] * 3),
+                A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
                 ToTensorV2(),
             ]
         )
 
-        self.train_ds = CheXpertDataset(train_df, self.data_dir, train_tf, img_size=self.img_size)
-        self.val_ds = CheXpertDataset(val_df, self.data_dir, val_tf, img_size=self.img_size)
+        self.train_ds = CheXpertDataset(
+            train_df, self.data_dir, train_tf, img_size=self.img_size
+        )
+        self.val_ds = CheXpertDataset(
+            val_df, self.data_dir, val_tf, img_size=self.img_size
+        )
 
         print(f"📊 Dataset: Train={len(self.train_ds)}, Val={len(self.val_ds)}")
 

@@ -6,47 +6,49 @@ import numpy as np
 from sklearn.metrics import roc_auc_score
 
 from src.backbone import CheXpertModel
-
-# ต้องตรงกับ TARGET_COLS ใน dataset.py (ชื่อให้เหมือนกันไปเลย)
-CLASS_NAMES = [
-    "Atelectasis",
-    "Cardiomegaly",
-    "Consolidation",
-    "Edema",
-    "Pleural Effusion",
-]
+from src.constants import CLASS_NAMES, NUM_CLASSES
 
 
 class CheXpertLightning(pl.LightningModule):
     def __init__(
         self,
-        model_name="densenet121",
-        num_classes=5,
-        lr=1e-4,
-        dropout=0.3,
+        model_name: str = "densenet121",
+        num_classes: int = NUM_CLASSES,
+        lr: float = 1e-4,
+        dropout: float = 0.3,
         pos_weight=None,  # list หรือ tensor shape (C,)
+        weight_decay: float = 1e-4,
+        scheduler_monitor: str = "val_auc",  # แนะนำให้ตาม metric แข่ง
     ):
         super().__init__()
-        self.save_hyperparameters()
+        self.save_hyperparameters(ignore=["pos_weight"])
 
+        # Backbone
         self.model = CheXpertModel(
             model_name=model_name,
             num_classes=num_classes,
             dropout=dropout,
         )
 
-        # pos_weight: register_buffer เพื่อย้าย GPU อัตโนมัติ
+        # pos_weight -> buffer (ย้าย GPU อัตโนมัติ)
         if pos_weight is not None:
             if not isinstance(pos_weight, torch.Tensor):
                 pos_weight = torch.tensor(pos_weight, dtype=torch.float32)
+            # safety: shape (C,)
+            if pos_weight.ndim != 1 or pos_weight.numel() != num_classes:
+                raise ValueError(
+                    f"pos_weight must be shape ({num_classes},) but got {tuple(pos_weight.shape)}"
+                )
             self.register_buffer("pos_weight", pos_weight)
         else:
-            self.pos_weight = None
+            self.register_buffer("pos_weight", torch.tensor([]))  # placeholder
 
         self.lr = lr
+        self.weight_decay = weight_decay
         self.num_classes = num_classes
+        self.scheduler_monitor = scheduler_monitor
 
-        # เก็บ val outputs เพื่อคำนวณ AUC แบบ ignore -1 ได้ถูกต้อง
+        # เก็บ outputs สำหรับ AUC แบบ ignore -1
         self._val_probs = []
         self._val_targets = []
 
@@ -56,22 +58,28 @@ class CheXpertLightning(pl.LightningModule):
     # -----------------------------
     # Masked BCE (ignore -1)
     # -----------------------------
-    def _masked_bce(self, logits, y):
+    def _masked_bce(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
         """
         logits: (B,C)
-        y: (B,C) with values in {0,1,-1}
+        y: (B,C) in {0,1,-1}
         """
-        mask = (y >= 0).float()           # 1 where label valid
-        y01 = y.clamp(0, 1)               # -1 -> 0 temporarily
+        mask = (y >= 0).float()  # 1 where label valid
+        y01 = y.clamp(0, 1)      # -1 -> 0 temporarily
+
+        # pos_weight: use only if provided
+        pw = None
+        if self.pos_weight.numel() > 0:
+            pw = self.pos_weight  # shape (C,)
 
         bce = F.binary_cross_entropy_with_logits(
             logits,
             y01,
-            pos_weight=self.pos_weight if self.pos_weight is not None else None,  # shape (C,)
+            pos_weight=pw,
             reduction="none",
-        )                                  # (B,C)
+        )  # (B,C)
 
-        loss = (bce * mask).sum() / (mask.sum() + 1e-6)
+        denom = mask.sum().clamp_min(1.0)  # กันหาร 0
+        loss = (bce * mask).sum() / denom
         return loss
 
     # -----------------------------
@@ -100,7 +108,6 @@ class CheXpertLightning(pl.LightningModule):
 
         probs = torch.sigmoid(logits)
 
-        # เก็บไว้คำนวณ AUC แบบ ignore -1 จริง
         self._val_probs.append(probs.detach().cpu())
         self._val_targets.append(y.detach().cpu())
 
@@ -125,10 +132,10 @@ class CheXpertLightning(pl.LightningModule):
             aucs.append(auc)
             per_class[CLASS_NAMES[c]] = auc
 
-        mean_auc = np.nanmean(aucs)
+        mean_auc = float(np.nanmean(aucs)) if np.isfinite(np.nanmean(aucs)) else 0.0
 
         # log mean (ใช้ checkpoint / early stop)
-        self.log("val_auc", float(mean_auc), prog_bar=True, logger=True)
+        self.log("val_auc", mean_auc, prog_bar=True, logger=True)
 
         # log per-class
         for k, v in per_class.items():
@@ -146,18 +153,29 @@ class CheXpertLightning(pl.LightningModule):
         optimizer = torch.optim.AdamW(
             self.parameters(),
             lr=self.lr,
-            weight_decay=1e-4,
+            weight_decay=self.weight_decay,
         )
 
-        scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer,
-            mode="min",
-            factor=0.1,
-            patience=3,
-        )
+        # แนะนำ monitor val_auc สำหรับงานแข่ง/selection
+        if self.scheduler_monitor == "val_auc":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                factor=0.1,
+                patience=2,
+            )
+            monitor = "val_auc"
+        else:
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="min",
+                factor=0.1,
+                patience=3,
+            )
+            monitor = "val_loss"
 
         return {
             "optimizer": optimizer,
             "lr_scheduler": scheduler,
-            "monitor": "val_loss",
+            "monitor": monitor,
         }
