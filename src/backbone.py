@@ -10,32 +10,56 @@ except ImportError:
 
 
 MODEL_ALIASES = {
-    # torchvision
+    # torchvision (รองรับทั้ง - และ _)
     "densenet121": "densenet121",
     "efficientnet_b0": "efficientnet_b0",
+    "efficientnet-b0": "efficientnet_b0",
     "convnext_tiny": "convnext_tiny",
+    "convnext-tiny": "convnext_tiny",
 
     # timm
     "efficientnet_b3": "efficientnet_b3",
+    "efficientnet-b3": "efficientnet_b3",
+
     "swin_tiny": "swin_tiny_patch4_window7_224",
     "swin_t": "swin_tiny_patch4_window7_224",
 }
 
 
+def _try_set_swin_img_size(backbone, img_size: int):
+    """
+    timm Swin บางเวอร์ชันจะ assert ว่าขนาด input ต้องตรงกับ patch_embed.img_size
+    วิธี robust:
+    - ถ้าปรับได้: set patch_embed.img_size = (img_size, img_size)
+    - บางโมเดลเก็บเป็น list/tuple/torch.Size ก็รองรับ
+    """
+    if hasattr(backbone, "patch_embed") and hasattr(backbone.patch_embed, "img_size"):
+        backbone.patch_embed.img_size = (img_size, img_size)
+
+    # บางเวอร์ชัน patch_embed มี _img_size
+    if hasattr(backbone, "patch_embed") and hasattr(backbone.patch_embed, "_img_size"):
+        backbone.patch_embed._img_size = (img_size, img_size)
+
+
 class CheXpertModel(nn.Module):
     def __init__(
         self,
-        model_name="densenet121",
-        num_classes=5,
-        pretrained=True,
-        dropout=0.3,
+        model_name: str = "densenet121",
+        num_classes: int = 5,
+        pretrained: bool = True,
+        dropout: float = 0.3,
+        img_size: int = 384,
     ):
         super().__init__()
 
         model_key = MODEL_ALIASES.get(model_name, model_name)
         self.model_name = model_name
         self.model_key = model_key
+        self.img_size = img_size
 
+        # =====================
+        # torchvision models
+        # =====================
         if model_key == "densenet121":
             weights = models.DenseNet121_Weights.DEFAULT if pretrained else None
             backbone = models.densenet121(weights=weights)
@@ -63,6 +87,9 @@ class CheXpertModel(nn.Module):
                 nn.Linear(in_f, num_classes),
             )
 
+        # =====================
+        # timm models
+        # =====================
         else:
             if not TIMM_AVAILABLE:
                 raise ValueError(
@@ -70,12 +97,26 @@ class CheXpertModel(nn.Module):
                     f"Install timm: pip install timm"
                 )
 
-            backbone = timm.create_model(
-                model_key,
+            kwargs = dict(
                 pretrained=pretrained,
                 num_classes=num_classes,
                 drop_rate=dropout,
             )
+
+            # ✅ พยายามส่ง img_size ให้ Swin (ถ้า timm รองรับ)
+            if "swin" in model_key:
+                kwargs["img_size"] = img_size
+
+            try:
+                backbone = timm.create_model(model_key, **kwargs)
+            except TypeError:
+                # timm บางเวอร์ชันไม่รับ img_size ตอนสร้าง
+                kwargs.pop("img_size", None)
+                backbone = timm.create_model(model_key, **kwargs)
+
+            # ✅ fallback: ปรับ patch_embed.img_size หลังสร้าง กัน assert 224/384
+            if "swin" in model_key:
+                _try_set_swin_img_size(backbone, img_size)
 
         self.backbone = backbone
 

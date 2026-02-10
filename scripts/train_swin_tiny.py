@@ -1,3 +1,7 @@
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, LearningRateMonitor
@@ -36,6 +40,7 @@ def main():
     model = CheXpertLightning(
         model_name=MODEL_NAME,
         num_classes=NUM_CLASSES,
+        img_size=IMG_SIZE,
         lr=LR,
         pos_weight=POS_WEIGHT,
         scheduler_monitor="val_auc",
