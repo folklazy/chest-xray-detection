@@ -3,7 +3,7 @@ seed: 42
 
 data:
   data_dir: "./data"
-  csv_path: "./data/CheXpert-v1.0-small/train.csv"
+  csv_path: "./data/CheXpert_full/train.csv"
   policy: "custom"          # your hybrid policy (Atelectasis U-Ones, etc.)
   img_size: 384
   batch_size: 12

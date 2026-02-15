@@ -1,133 +1,181 @@
+# src/backbone.py
+from __future__ import annotations
+
+from dataclasses import dataclass
+
 import torch
 import torch.nn as nn
 from torchvision import models
 
 try:
-    import timm
-    TIMM_AVAILABLE = True
+    import torchxrayvision as xrv
+    XRV_AVAILABLE = True
 except ImportError:
-    TIMM_AVAILABLE = False
+    XRV_AVAILABLE = False
 
 
-MODEL_ALIASES = {
-    # torchvision (รองรับทั้ง - และ _)
+# =====================================================
+# Supported models (only 2, keep it strict)
+# =====================================================
+MODEL_ALIASES: dict[str, str] = {
     "densenet121": "densenet121",
-    "efficientnet_b0": "efficientnet_b0",
-    "efficientnet-b0": "efficientnet_b0",
-    "convnext_tiny": "convnext_tiny",
-    "convnext-tiny": "convnext_tiny",
-
-    # timm
-    "efficientnet_b3": "efficientnet_b3",
-    "efficientnet-b3": "efficientnet_b3",
-
-    "swin_tiny": "swin_tiny_patch4_window7_224",
-    "swin_t": "swin_tiny_patch4_window7_224",
+    "xrv_densenet121_res224_all": "densenet121-res224-all",
 }
 
 
-def _try_set_swin_img_size(backbone, img_size: int):
+def _is_head_param(name: str) -> bool:
     """
-    timm Swin บางเวอร์ชันจะ assert ว่าขนาด input ต้องตรงกับ patch_embed.img_size
-    วิธี robust:
-    - ถ้าปรับได้: set patch_embed.img_size = (img_size, img_size)
-    - บางโมเดลเก็บเป็น list/tuple/torch.Size ก็รองรับ
+    Parameters that belong to the task head / classifier.
+    - torchvision DenseNet: classifier.*
+    - our XRV wrapper:      head.*
+    - (generic)             fc.*
     """
-    if hasattr(backbone, "patch_embed") and hasattr(backbone.patch_embed, "img_size"):
-        backbone.patch_embed.img_size = (img_size, img_size)
-
-    # บางเวอร์ชัน patch_embed มี _img_size
-    if hasattr(backbone, "patch_embed") and hasattr(backbone.patch_embed, "_img_size"):
-        backbone.patch_embed._img_size = (img_size, img_size)
+    return name.startswith(("classifier.", "head.", "fc."))
 
 
+@dataclass(frozen=True)
+class ModelIO:
+    expected_in_channels: int
+
+
+# =====================================================
+# XRV wrapper: features -> relu -> GAP -> head
+# =====================================================
+class XrvDenseNetFeatures(nn.Module):
+    """
+    TorchXRayVision DenseNet applies op_norm if you call model(x) directly.
+    We avoid that:
+      x -> base.features -> relu -> GAP -> head
+
+    Expected input: (B,1,H,W) float32, already xrv-normalized in dataset.
+
+    Note:
+    - XRV pretrained weight here is res224; it can still accept other sizes
+      (conv + GAP), but distribution differs from training resolution.
+    """
+    def __init__(self, base: nn.Module, num_classes: int, dropout: float):
+        super().__init__()
+        self.base = base
+        self.features = base.features  # feature extractor only
+
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Robustly infer feature dim by running a dummy forward through features.
+        # This avoids hard-coding (e.g., 1024) which can break if a model variant changes.
+        with torch.no_grad():
+            dummy = torch.zeros(1, 1, 224, 224)  # weights are res224-all
+            feats = self.features(dummy)
+            feats = torch.relu(feats)
+            feats = self.pool(feats)
+            in_f = int(feats.flatten(1).shape[1])
+
+        self.head = nn.Sequential(
+            nn.Dropout(float(dropout)),
+            nn.Linear(in_f, int(num_classes)),
+        )
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[1] != 1:
+            raise ValueError(f"XRV expects input (B,1,H,W) but got {tuple(x.shape)}")
+
+        feats = self.features(x)
+        feats = torch.relu(feats)
+        feats = self.pool(feats)
+        feats = torch.flatten(feats, 1)
+        return self.head(feats)
+
+
+# =====================================================
+# Builders
+# =====================================================
+def _build_torchvision_densenet121(
+    num_classes: int,
+    pretrained: bool,
+    dropout: float
+) -> tuple[nn.Module, ModelIO]:
+    weights = models.DenseNet121_Weights.DEFAULT if pretrained else None
+    net = models.densenet121(weights=weights)
+
+    in_f = int(net.classifier.in_features)
+    net.classifier = nn.Sequential(
+        nn.Dropout(float(dropout)),
+        nn.Linear(in_f, int(num_classes)),
+    )
+    return net, ModelIO(expected_in_channels=3)
+
+
+def _build_xrv_densenet121_all(
+    num_classes: int,
+    pretrained: bool,
+    dropout: float
+) -> tuple[nn.Module, ModelIO]:
+    if not XRV_AVAILABLE:
+        raise ValueError("torchxrayvision not installed. pip install torchxrayvision")
+
+    weights_name = MODEL_ALIASES["xrv_densenet121_res224_all"]
+    if pretrained:
+        try:
+            base = xrv.models.get_model(weights_name)
+        except TypeError:
+            base = xrv.models.DenseNet(weights=weights_name)
+    else:
+        base = xrv.models.DenseNet(weights=None)
+
+    net = XrvDenseNetFeatures(base, num_classes=int(num_classes), dropout=float(dropout))
+    return net, ModelIO(expected_in_channels=1)
+
+
+# =====================================================
+# Main model
+# =====================================================
 class CheXpertModel(nn.Module):
+    """
+    Supported model_name:
+      - "densenet121"                (torchvision, expects 3ch, any HxW ok)
+      - "xrv_densenet121_res224_all" (torchxrayvision, expects 1ch, pretrained on ~224)
+    """
     def __init__(
         self,
         model_name: str = "densenet121",
-        num_classes: int = 5,
+        num_classes: int = 14,
         pretrained: bool = True,
-        dropout: float = 0.3,
-        img_size: int = 384,
+        dropout: float = 0.2,
+        img_size: int = 384,  # kept for logging/consistency (model accepts variable size)
     ):
         super().__init__()
+        self.model_name = str(model_name)
+        self.model_key = MODEL_ALIASES.get(self.model_name, self.model_name)
 
-        model_key = MODEL_ALIASES.get(model_name, model_name)
-        self.model_name = model_name
-        self.model_key = model_key
-        self.img_size = img_size
+        self.num_classes = int(num_classes)
+        self.img_size = int(img_size)
 
-        # =====================
-        # torchvision models
-        # =====================
-        if model_key == "densenet121":
-            weights = models.DenseNet121_Weights.DEFAULT if pretrained else None
-            backbone = models.densenet121(weights=weights)
-            in_f = backbone.classifier.in_features
-            backbone.classifier = nn.Sequential(
-                nn.Dropout(dropout),
-                nn.Linear(in_f, num_classes),
-            )
+        if self.model_name == "densenet121":
+            self.backbone, io = _build_torchvision_densenet121(self.num_classes, pretrained, dropout)
 
-        elif model_key == "efficientnet_b0":
-            weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
-            backbone = models.efficientnet_b0(weights=weights)
-            in_f = backbone.classifier[-1].in_features
-            backbone.classifier[-1] = nn.Sequential(
-                nn.Dropout(dropout),
-                nn.Linear(in_f, num_classes),
-            )
+        elif self.model_name == "xrv_densenet121_res224_all":
+            self.backbone, io = _build_xrv_densenet121_all(self.num_classes, pretrained, dropout)
 
-        elif model_key == "convnext_tiny":
-            weights = models.ConvNeXt_Tiny_Weights.DEFAULT if pretrained else None
-            backbone = models.convnext_tiny(weights=weights)
-            in_f = backbone.classifier[-1].in_features
-            backbone.classifier[-1] = nn.Sequential(
-                nn.Dropout(dropout),
-                nn.Linear(in_f, num_classes),
-            )
-
-        # =====================
-        # timm models
-        # =====================
         else:
-            if not TIMM_AVAILABLE:
-                raise ValueError(
-                    f"Unsupported model: {model_name} (resolved: {model_key}). "
-                    f"Install timm: pip install timm"
-                )
-
-            kwargs = dict(
-                pretrained=pretrained,
-                num_classes=num_classes,
-                drop_rate=dropout,
+            raise ValueError(
+                f"Unsupported model_name: {self.model_name}. "
+                f"Allowed: {list(MODEL_ALIASES.keys())}"
             )
 
-            # ✅ พยายามส่ง img_size ให้ Swin (ถ้า timm รองรับ)
-            if "swin" in model_key:
-                kwargs["img_size"] = img_size
+        self.expected_in_channels = int(io.expected_in_channels)
 
-            try:
-                backbone = timm.create_model(model_key, **kwargs)
-            except TypeError:
-                # timm บางเวอร์ชันไม่รับ img_size ตอนสร้าง
-                kwargs.pop("img_size", None)
-                backbone = timm.create_model(model_key, **kwargs)
-
-            # ✅ fallback: ปรับ patch_embed.img_size หลังสร้าง กัน assert 224/384
-            if "swin" in model_key:
-                _try_set_swin_img_size(backbone, img_size)
-
-        self.backbone = backbone
-
-    def forward(self, x):
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if x.ndim != 4 or x.shape[1] != self.expected_in_channels:
+            raise ValueError(
+                f"{self.model_name} expects input (B,{self.expected_in_channels},H,W) "
+                f"but got {tuple(x.shape)}. Check dataset preprocess mode."
+            )
         return self.backbone(x)
 
-    def freeze_features(self):
+    def freeze_features(self) -> None:
+        """Freeze everything except task head/classifier."""
         for name, p in self.backbone.named_parameters():
-            if ("classifier" not in name) and ("head" not in name) and ("fc" not in name):
-                p.requires_grad = False
+            p.requires_grad = _is_head_param(name)
 
-    def unfreeze_all(self):
+    def unfreeze_all(self) -> None:
         for p in self.backbone.parameters():
             p.requires_grad = True

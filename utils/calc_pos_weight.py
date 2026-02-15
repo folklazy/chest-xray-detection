@@ -18,8 +18,8 @@ def calc_pos_weight(data_dir: str, csv_path: str) -> list:
     """
     # สร้าง DataModule
     dm = CheXpertDataModule(
-        data_dir="./data",
-        csv_path="./data/CheXpert-v1.0-small/train.csv",
+        data_dir=data_dir,
+        csv_path=csv_path,
         batch_size=64,
         num_workers=0
     )
@@ -56,6 +56,6 @@ def calc_pos_weight(data_dir: str, csv_path: str) -> list:
 if __name__ == "__main__":
     # === แก้ path ตรงนี้ ===
     DATA_DIR = "./data"
-    CSV_PATH = "./data/CheXpert-v1.0-small/train.csv"
+    CSV_PATH = "./data/CheXpert_full/train.csv"
     
     calc_pos_weight(DATA_DIR, CSV_PATH)
