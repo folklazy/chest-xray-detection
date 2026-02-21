@@ -14,9 +14,9 @@ from src.constants import NUM_CLASSES
 DATA_DIR = "./data"
 CSV_PATH = "./data/CheXpert-v1.0-small/train.csv"
 
-IMG_SIZE = 384
+IMG_SIZE = 320
 BATCH_SIZE = 16
-NUM_WORKERS = 4
+NUM_WORKERS = 8  # ✅ เพิ่ม workers เป็น 8 เพื่อโหลดรูปเร็วขึ้น
 MODEL_NAME = "densenet121"
 LR = 1e-4
 EPOCHS = 8
@@ -26,6 +26,9 @@ POS_WEIGHT = [5.68, 7.29, 14.01, 3.28, 1.59]
 def main():
     pl.seed_everything(42, workers=True)
     torch.set_float32_matmul_precision("medium")
+    
+    # ✅ เปิด cudnn.benchmark ให้รันคอนโวลูชั่นเร็วที่สุดสำหรับรูป 384x384
+    torch.backends.cudnn.benchmark = True
 
     dm = CheXpertDataModule(
         data_dir=DATA_DIR,
