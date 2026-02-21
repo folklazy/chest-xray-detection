@@ -20,7 +20,7 @@ CSV_PATH = "./data/CheXpert-v1.0-small/train.csv"
 
 IMG_SIZE = 384  # ✅ เพิ่มจาก 320 → ช่วย Atelectasis/Consolidation
 BATCH_SIZE = 12  # ✅ ลดจาก 16 → VRAM ไหว
-NUM_WORKERS = 4
+NUM_WORKERS = 8  # ✅ เพิ่ม workers เพื่อเร่งการโหลดรูปภาพ
 
 MODEL_NAME = "convnext_tiny"  # densenet121, efficientnet-b0, convnext_tiny
 LR = 3e-4  # ConvNeXt ชอบ LR สูงกว่า DenseNet
@@ -39,6 +39,9 @@ def main():
 
     # ✅ RTX 4070: เปิด Tensor Cores ให้เร็วขึ้น
     torch.set_float32_matmul_precision("medium")
+    
+    # ✅ เปิด cudnn.benchmark ช่วยให้ CuDNN หาอัลกอริทึมที่เร็วที่สุดสำหรับขนาดภาพคงที่
+    torch.backends.cudnn.benchmark = True
 
     # -----------------------------
     # DataModule (🔥 Stanford Policy)

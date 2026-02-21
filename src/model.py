@@ -34,6 +34,9 @@ class CheXpertLightning(pl.LightningModule):
             num_classes=num_classes,
             dropout=dropout,
         )
+        
+        # ✅ แปลง memory format ของโมเดลให้เป็น channels_last (N, H, W, C) เพื่อให้ Tensor Core ทำงานเร็วขึ้น
+        self.model = self.model.to(memory_format=torch.channels_last)
 
         # pos_weight: register_buffer เพื่อย้าย GPU อัตโนมัติ
         if pos_weight is not None:
@@ -51,6 +54,9 @@ class CheXpertLightning(pl.LightningModule):
         self._val_targets = []
 
     def forward(self, x):
+        # ✅ มั่นใจว่า Input x เป็น channels_last ก่อนส่งเข้าโมเดล
+        if x.dim() == 4:
+            x = x.to(memory_format=torch.channels_last)
         return self.model(x)
 
     # -----------------------------
