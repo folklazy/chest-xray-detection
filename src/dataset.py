@@ -2,16 +2,18 @@
 # CheXpert Dataset & DataModule
 # =====================================================
 #
-# Uncertainty Policy (Custom):
+# Uncertainty Policy (Custom) — ตาม CheXpert paper + EDA:
 # ----------------------------
-# | Disease          | Policy   | -1 →  |
-# |------------------|----------|-------|
-# | Atelectasis      | U-Ones   | 1     |
-# | Cardiomegaly     | U-Zeros  | 0     |
-# | Consolidation    | U-Ignore | -1    | (masked in loss/AUC)
-# | Edema            | U-Ones   | 1     |
-# | Pleural Effusion | U-Ones   | 1     |
+# | Disease          | Policy   | -1 →  | เหตุผล                          |
+# |------------------|----------|-------|---------------------------------|
+# | Atelectasis      | U-Ones   |  1    | uncertain ≈ positive (33k each) |
+# | Cardiomegaly     | U-Zeros  |  0    | positive มีพอแล้ว (27k)          |
+# | Consolidation    | U-Ignore | -1    | uncertain > positive 2x         |
+# | Edema            | U-Ones   |  1    | paper แนะนำ                      |
+# | Pleural Effusion | U-Ones   |  1    | positive เยอะ แต่ uncertain ≈ 12k|
 #
+# ⚠️  fillna และ replace -1 ต้องทำแยกต่อ column เพื่อไม่ให้ Consolidation
+#     ถูก fillna(0) ก่อนแล้ว -1 หายไป
 # =====================================================
 
 import os
@@ -21,19 +23,77 @@ import pandas as pd
 import torch
 from torch.utils.data import Dataset, DataLoader
 import pytorch_lightning as pl
-from sklearn.model_selection import train_test_split
 import albumentations as A
 from albumentations.pytorch import ToTensorV2
 
 from src.constants import TARGET_COLS, IMAGENET_MEAN, IMAGENET_STD
 
 
+# =====================================================
+# CLAHE helper (เพิ่ม contrast ให้ X-ray)
+# =====================================================
+_CLAHE = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+
+
+def apply_clahe(gray: np.ndarray) -> np.ndarray:
+    """รับ grayscale uint8 คืน grayscale uint8 ที่ contrast ดีขึ้น"""
+    return _CLAHE.apply(gray)
+
+
+# =====================================================
+# Label helper
+# =====================================================
+
+def apply_uncertainty_policy(df: pd.DataFrame, policy: str) -> pd.DataFrame:
+    """
+    จัดการ -1 (uncertain) และ NaN แยกต่อ column
+    ลำดับสำคัญ: ต้อง replace -1 ก่อน fillna เสมอ
+    """
+    df = df.copy()
+
+    if policy == "custom":
+        # --- Atelectasis: U-Ones (-1 → 1), NaN → 0
+        df["Atelectasis"] = df["Atelectasis"].replace(-1, 1).fillna(0)
+
+        # --- Cardiomegaly: U-Zeros (-1 → 0), NaN → 0
+        df["Cardiomegaly"] = df["Cardiomegaly"].replace(-1, 0).fillna(0)
+
+        # --- Consolidation: U-Ignore (คง -1 ไว้ → masked loss), NaN → 0
+        #     ⚠️ ต้องไม่ replace -1 !
+        df["Consolidation"] = df["Consolidation"].fillna(0)
+        # -1 ยังคงอยู่ → _masked_bce จะ mask ออก
+
+        # --- Edema: U-Ones (-1 → 1), NaN → 0
+        df["Edema"] = df["Edema"].replace(-1, 1).fillna(0)
+
+        # --- Pleural Effusion: U-Ones (-1 → 1), NaN → 0
+        df["Pleural Effusion"] = df["Pleural Effusion"].replace(-1, 1).fillna(0)
+
+    elif policy == "u-zeros":
+        for col in TARGET_COLS:
+            df[col] = df[col].replace(-1, 0).fillna(0)
+
+    elif policy == "u-ones":
+        for col in TARGET_COLS:
+            df[col] = df[col].replace(-1, 1).fillna(0)
+
+    else:
+        raise ValueError(f"Unknown policy: {policy!r}. Choose: custom | u-zeros | u-ones")
+
+    return df
+
+
+# =====================================================
+# Dataset
+# =====================================================
+
 class CheXpertDataset(Dataset):
-    def __init__(self, df, root_dir, transform=None, img_size=384):
+    def __init__(self, df, root_dir, transform=None, img_size=384, use_clahe=True):
         self.df = df.reset_index(drop=True)
         self.root_dir = root_dir
         self.transform = transform
         self.img_size = img_size
+        self.use_clahe = use_clahe
 
         self.paths = self.df["Path"].values
         self.labels = self.df[TARGET_COLS].values.astype(np.float32)
@@ -45,14 +105,20 @@ class CheXpertDataset(Dataset):
         rel_path = self.paths[idx]
         img_path = os.path.join(self.root_dir, rel_path)
 
+        # --- Load grayscale
         image = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
         if image is None:
-            # กัน training crash ถ้า path ผิด/ไฟล์หาย
+            # fallback: blank image (กัน crash ถ้าไฟล์หาย)
             image = np.zeros((self.img_size, self.img_size), dtype=np.uint8)
 
-        # 1ch -> 3ch (ใช้ pretrained ImageNet)
-        image = np.stack([image] * 3, axis=-1)
+        # --- CLAHE (เพิ่ม local contrast ก่อน augment)
+        if self.use_clahe:
+            image = apply_clahe(image)
 
+        # --- 1ch → 3ch (DenseNet/pretrained ต้องการ 3ch)
+        image = np.stack([image] * 3, axis=-1)  # (H, W, 3)
+
+        # --- Augmentation + Normalize
         if self.transform:
             image = self.transform(image=image)["image"]
 
@@ -60,17 +126,22 @@ class CheXpertDataset(Dataset):
         return image, label
 
 
+# =====================================================
+# DataModule
+# =====================================================
+
 class CheXpertDataModule(pl.LightningDataModule):
     def __init__(
         self,
-        data_dir,
-        csv_path,
-        img_size=384,
-        batch_size=32,
-        num_workers=4,
-        policy="custom",  # u-zeros | u-ones | custom
-        seed=42,
-        frontal_only=True,
+        data_dir: str,
+        csv_path: str,
+        img_size: int = 384,
+        batch_size: int = 32,
+        num_workers: int = 4,
+        policy: str = "custom",
+        seed: int = 42,
+        frontal_only: bool = True,
+        use_clahe: bool = True,
     ):
         super().__init__()
         self.data_dir = data_dir
@@ -81,94 +152,121 @@ class CheXpertDataModule(pl.LightningDataModule):
         self.policy = policy
         self.seed = seed
         self.frontal_only = frontal_only
+        self.use_clahe = use_clahe
 
     def setup(self, stage=None):
-        df = pd.read_csv(self.csv_path)
+        # =====================================================
+        # TRAIN: ใช้ train.csv ทั้งหมด (ไม่ split)
+        #   → เพิ่มข้อมูล train จาก ~172k → ~191k images
+        # VAL:   ใช้ valid.csv (radiologist-annotated ground truth)
+        #   → label สะอาด, ตรงกับ leaderboard, น่าเชื่อถือกว่า auto-labeler
+        # =====================================================
 
-        # Optional: use only Frontal views (stabilizes training)
-        if self.frontal_only and "Frontal/Lateral" in df.columns:
-            df = df[df["Frontal/Lateral"] == "Frontal"].copy()
+        # --- Train CSV
+        train_df = pd.read_csv(self.csv_path)
 
-        # Fill NaN with 0
-        df[TARGET_COLS] = df[TARGET_COLS].fillna(0)
+        # --- Val CSV (อยู่ folder เดียวกับ train.csv)
+        val_csv_path = self.csv_path.replace("train.csv", "valid.csv")
+        val_df = pd.read_csv(val_csv_path)
 
-        # ----------------------------
-        # Uncertainty policy (-1)
-        # ----------------------------
-        if self.policy == "custom":
-            u_zeros_cols = ["Cardiomegaly"]
-            u_ones_cols = ["Atelectasis", "Edema", "Pleural Effusion"]
-            # Consolidation stays -1
+        # --- Frontal only สำหรับ train (Lateral confuse model)
+        if self.frontal_only and "Frontal/Lateral" in train_df.columns:
+            before = len(train_df)
+            train_df = train_df[train_df["Frontal/Lateral"] == "Frontal"].copy()
+            print(f"📷 Train Frontal only: {before:,} → {len(train_df):,} images")
 
-            for col in u_zeros_cols:
-                df[col] = df[col].replace(-1, 0)
-            for col in u_ones_cols:
-                df[col] = df[col].replace(-1, 1)
+        # --- Apply uncertainty policy เฉพาะ train
+        # valid.csv ไม่มี -1 (radiologist annotate มาสะอาดแล้ว)
+        train_df = apply_uncertainty_policy(train_df, self.policy)
 
-        elif self.policy == "u-zeros":
-            df[TARGET_COLS] = df[TARGET_COLS].replace(-1, 0)
+        # --- valid.csv: fillna(0) เฉยๆ ไม่ต้อง policy
+        for col in TARGET_COLS:
+            val_df[col] = val_df[col].fillna(0)
 
-        elif self.policy == "u-ones":
-            df[TARGET_COLS] = df[TARGET_COLS].replace(-1, 1)
+        print(f"📊 Train: {len(train_df):,} | Val: {len(val_df):,} (radiologist-annotated)")
 
-        else:
-            raise ValueError(f"Unknown policy: {self.policy}")
+        # --- Transforms
+        train_tf = A.Compose([
+            # รักษา aspect ratio (สำคัญสำหรับ X-ray)
+            A.LongestMaxSize(max_size=self.img_size),
+            A.PadIfNeeded(
+                min_height=self.img_size,
+                min_width=self.img_size,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+            ),
+            # Geometric augmentation (X-ray สามารถ flip ซ้าย-ขวาได้)
+            A.HorizontalFlip(p=0.5),
+            A.ShiftScaleRotate(
+                shift_limit=0.05,
+                scale_limit=0.10,
+                rotate_limit=10,
+                border_mode=cv2.BORDER_CONSTANT,
+                p=0.5,
+            ),
+            # Intensity augmentation (simulate different exposure)
+            A.RandomBrightnessContrast(
+                brightness_limit=0.2,
+                contrast_limit=0.2,
+                p=0.3,
+            ),
+            # Noise / blur เล็กน้อย (กัน overfit texture)
+            A.GaussianBlur(blur_limit=3, p=0.1),
+            A.GaussNoise(p=0.1),
+            # CoarseDropout — บังคับโมเดลไม่ให้จำ support devices (สาย/อุปกรณ์)
+            # สุ่มเจาะช่องสี่เหลี่ยมดำบนภาพ → โมเดลต้องดูเนื้อเยื่อปอดจริงๆ แทน
+            A.CoarseDropout(
+                max_holes=8,       # สูงสุด 8 ช่อง
+                max_height=32,     # สูงสุด 32px (~8% ของ 384)
+                max_width=32,
+                min_holes=2,       # อย่างน้อย 2 ช่อง
+                min_height=8,
+                min_width=8,
+                fill_value=0,      # เติมสีดำ (สอดคล้องกับ background X-ray)
+                p=0.3,             # ใช้ 30% ของ batch ไม่ aggressive เกินไป
+            ),
+            # Normalize ด้วย ImageNet stats (ใช้กับ pretrained model)
+            A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ToTensorV2(),
+        ])
 
-        # ----------------------------
-        # Patient-level split
-        # ----------------------------
-        # Path format: CheXpert-v1.0-small/train/patient00001/study1/view1_frontal.jpg
-        df["Patient"] = df["Path"].apply(lambda x: x.split("/")[2])
-
-        patients = df["Patient"].unique()
-        train_p, val_p = train_test_split(
-            patients, test_size=0.1, random_state=self.seed
-        )
-
-        train_df = df[df["Patient"].isin(train_p)].copy()
-        val_df = df[df["Patient"].isin(val_p)].copy()
-
-        # ----------------------------
-        # Transforms (preserve aspect ratio)
-        # ----------------------------
-        train_tf = A.Compose(
-            [
-                A.LongestMaxSize(max_size=self.img_size),
-                A.PadIfNeeded(
-                    min_height=self.img_size,
-                    min_width=self.img_size,
-                    border_mode=cv2.BORDER_CONSTANT,
-                    fill=0,
-                ),
-                A.HorizontalFlip(p=0.5),
-                A.Rotate(limit=3, p=0.1),
-                A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-                ToTensorV2(),
-            ]
-        )
-
-        val_tf = A.Compose(
-            [
-                A.LongestMaxSize(max_size=self.img_size),
-                A.PadIfNeeded(
-                    min_height=self.img_size,
-                    min_width=self.img_size,
-                    border_mode=cv2.BORDER_CONSTANT,
-                    fill=0,
-                ),
-                A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
-                ToTensorV2(),
-            ]
-        )
+        val_tf = A.Compose([
+            A.LongestMaxSize(max_size=self.img_size),
+            A.PadIfNeeded(
+                min_height=self.img_size,
+                min_width=self.img_size,
+                border_mode=cv2.BORDER_CONSTANT,
+                fill=0,
+            ),
+            A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),
+            ToTensorV2(),
+        ])
 
         self.train_ds = CheXpertDataset(
-            train_df, self.data_dir, train_tf, img_size=self.img_size
+            train_df, self.data_dir, train_tf,
+            img_size=self.img_size, use_clahe=self.use_clahe,
         )
         self.val_ds = CheXpertDataset(
-            val_df, self.data_dir, val_tf, img_size=self.img_size
+            val_df, self.data_dir, val_tf,
+            img_size=self.img_size, use_clahe=self.use_clahe,
         )
 
-        print(f"📊 Dataset: Train={len(self.train_ds)}, Val={len(self.val_ds)}")
+        self._print_label_stats(train_df, "Train")
+        self._print_label_stats(val_df, "Val (radiologist)")
+
+    def _print_label_stats(self, df: pd.DataFrame, split: str):
+        """แสดง label distribution หลัง apply policy"""
+        print(f"\n📈 {split} label distribution (after policy):")
+        print(f"  {'Disease':<20} {'Pos':>7} {'Neg':>7} {'Ign(-1)':>8} {'Pos%':>7}")
+        print("  " + "-" * 55)
+        for col in TARGET_COLS:
+            pos  = (df[col] == 1).sum()
+            neg  = (df[col] == 0).sum()
+            ign  = (df[col] == -1).sum()
+            total_valid = pos + neg
+            pct  = pos / total_valid * 100 if total_valid > 0 else 0
+            print(f"  {col:<20} {pos:>7,} {neg:>7,} {ign:>8,} {pct:>6.1f}%")
+        print()
 
     def train_dataloader(self):
         return DataLoader(
