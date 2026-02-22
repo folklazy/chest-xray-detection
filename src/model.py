@@ -3,6 +3,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 import numpy as np
 from sklearn.metrics import roc_auc_score
+from torch.optim.lr_scheduler import CosineAnnealingLR
 
 from src.backbone import CheXpertModel
 from src.constants import CLASS_NAMES, NUM_CLASSES
@@ -13,12 +14,14 @@ class CheXpertLightning(pl.LightningModule):
         self,
         model_name: str = "densenet121",
         num_classes: int = NUM_CLASSES,
-        img_size: int = 384,            # ✅ เพิ่ม: ส่งให้ timm models (เช่น Swin)
-        lr: float = 1e-4,
+        img_size: int = 384,
+        lr: float = 3e-5,               # ลดจาก 1e-4 → 3e-5 แก้ปัญหา train_loss ขึ้น
         dropout: float = 0.3,
-        pos_weight=None,                # list หรือ tensor shape (C,)
+        pos_weight=None,
         weight_decay: float = 1e-4,
-        scheduler_monitor: str = "val_auc",  # "val_auc" หรือ "val_loss"
+        scheduler_monitor: str = "val_auc",
+        epochs: int = 10,               # ใช้กับ CosineAnnealingLR T_max
+        warmup_epochs: int = 1,         # warmup 1 epoch ก่อน cosine
     ):
         super().__init__()
         self.save_hyperparameters(ignore=["pos_weight"])
@@ -30,17 +33,18 @@ class CheXpertLightning(pl.LightningModule):
             model_name=model_name,
             num_classes=num_classes,
             dropout=dropout,
-            img_size=img_size,          # ✅ สำคัญ: กัน Swin assert 224/384
+            img_size=img_size,
         )
 
         self.lr = lr
         self.weight_decay = weight_decay
         self.num_classes = num_classes
         self.scheduler_monitor = scheduler_monitor
+        self.epochs = epochs
+        self.warmup_epochs = warmup_epochs
 
         # -----------------------------
-        # pos_weight buffer (always shape (C,))
-        # ✅ แก้ ckpt mismatch ตอน inference
+        # pos_weight buffer
         # -----------------------------
         if pos_weight is None:
             pos_weight = torch.zeros(num_classes, dtype=torch.float32)
@@ -54,7 +58,6 @@ class CheXpertLightning(pl.LightningModule):
 
         self.register_buffer("pos_weight", pos_weight)
 
-        # เก็บ outputs สำหรับ AUC แบบ ignore -1 จริง
         self._val_probs = []
         self._val_targets = []
 
@@ -65,26 +68,17 @@ class CheXpertLightning(pl.LightningModule):
     # Masked BCE (ignore -1)
     # -----------------------------
     def _masked_bce(self, logits: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
-        """
-        logits: (B,C)
-        y: (B,C) in {0,1,-1}
-        """
-        mask = (y >= 0).float()      # 1 where label valid
-        y01 = y.clamp(0, 1)          # -1 -> 0 temporarily
+        mask = (y >= 0).float()
+        y01  = y.clamp(0, 1)
 
-        # ใช้ pos_weight ก็ต่อเมื่อมีค่าไม่เป็นศูนย์อย่างน้อย 1 class
         pw = self.pos_weight if torch.any(self.pos_weight != 0) else None
 
         bce = F.binary_cross_entropy_with_logits(
-            logits,
-            y01,
-            pos_weight=pw,
-            reduction="none",
-        )  # (B,C)
+            logits, y01, pos_weight=pw, reduction="none",
+        )
 
         denom = mask.sum().clamp_min(1.0)
-        loss = (bce * mask).sum() / denom
-        return loss
+        return (bce * mask).sum() / denom
 
     # -----------------------------
     # Training
@@ -106,29 +100,25 @@ class CheXpertLightning(pl.LightningModule):
     def validation_step(self, batch, batch_idx):
         x, y = batch
         logits = self(x)
-
         loss = self._masked_bce(logits, y)
         self.log("val_loss", loss, prog_bar=True, logger=True)
 
         probs = torch.sigmoid(logits)
-
-        # เก็บไว้คำนวณ AUC แบบ ignore -1 จริง
         self._val_probs.append(probs.detach().cpu())
         self._val_targets.append(y.detach().cpu())
 
     def on_validation_epoch_end(self):
-        probs = torch.cat(self._val_probs, dim=0).numpy()      # (N,C)
-        targets = torch.cat(self._val_targets, dim=0).numpy()  # (N,C) with -1 possible
+        probs   = torch.cat(self._val_probs,   dim=0).numpy()
+        targets = torch.cat(self._val_targets, dim=0).numpy()
 
-        aucs = []
+        aucs      = []
         per_class = {}
 
         for c in range(self.num_classes):
-            t = targets[:, c]
-            p = probs[:, c]
+            t     = targets[:, c]
+            p     = probs[:, c]
             valid = t >= 0
 
-            # ต้องมีทั้ง 0 และ 1 ถึงคำนวณ AUC ได้
             if valid.sum() < 10 or len(np.unique(t[valid])) < 2:
                 auc = np.nan
             else:
@@ -140,13 +130,13 @@ class CheXpertLightning(pl.LightningModule):
         mean_auc = float(np.nanmean(aucs)) if np.isfinite(np.nanmean(aucs)) else 0.0
 
         self.log("val_auc", mean_auc, prog_bar=True, logger=True)
-
         for k, v in per_class.items():
-            if np.isnan(v):
-                continue
-            self.log(f"val_auc_{k}", float(v), logger=True)
+            if not np.isnan(v):
+                self.log(f"val_auc_{k}", float(v), logger=True)
 
-        print(f"\n[Epoch {self.current_epoch}] Mean AUC: {mean_auc:.4f}")
+        # แสดง LR ปัจจุบันด้วย (ช่วย debug)
+        current_lr = self.optimizers().param_groups[0]["lr"]
+        print(f"\n[Epoch {self.current_epoch}] Mean AUC: {mean_auc:.4f} | LR: {current_lr:.2e}")
         print({k: (None if np.isnan(v) else round(float(v), 4)) for k, v in per_class.items()})
 
     # -----------------------------
@@ -159,25 +149,35 @@ class CheXpertLightning(pl.LightningModule):
             weight_decay=self.weight_decay,
         )
 
-        if self.scheduler_monitor == "val_auc":
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="max",
-                factor=0.1,
-                patience=2,
-            )
-            monitor = "val_auc"
-        else:
-            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-                optimizer,
-                mode="min",
-                factor=0.1,
-                patience=3,
-            )
-            monitor = "val_loss"
+        # Cosine Annealing: LR ลดเรียบๆ จาก lr → eta_min ตลอด training
+        # ดีกว่า ReduceLROnPlateau ตรงที่ไม่ต้องรอ patience
+        cosine = CosineAnnealingLR(
+            optimizer,
+            T_max=self.epochs,
+            eta_min=1e-7,
+        )
+
+        # Linear Warmup: epoch แรก LR ค่อยๆ เพิ่มจาก 0 → lr
+        # ป้องกัน gradient explosion ช่วงแรก
+        def warmup_lambda(epoch):
+            if epoch < self.warmup_epochs:
+                return (epoch + 1) / self.warmup_epochs
+            return 1.0
+
+        warmup = torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda=warmup_lambda)
+
+        # SequentialLR: warmup ก่อน แล้วค่อย cosine
+        scheduler = torch.optim.lr_scheduler.SequentialLR(
+            optimizer,
+            schedulers=[warmup, cosine],
+            milestones=[self.warmup_epochs],
+        )
 
         return {
             "optimizer": optimizer,
-            "lr_scheduler": scheduler,
-            "monitor": monitor,
+            "lr_scheduler": {
+                "scheduler": scheduler,
+                "interval": "epoch",
+                "frequency": 1,
+            },
         }

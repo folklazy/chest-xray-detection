@@ -195,13 +195,14 @@ class CheXpertDataModule(pl.LightningDataModule):
                 border_mode=cv2.BORDER_CONSTANT,
                 fill=0,
             ),
-            # Geometric augmentation (X-ray สามารถ flip ซ้าย-ขวาได้)
+            # Geometric augmentation
             A.HorizontalFlip(p=0.5),
-            A.ShiftScaleRotate(
-                shift_limit=0.05,
-                scale_limit=0.10,
-                rotate_limit=10,
-                border_mode=cv2.BORDER_CONSTANT,
+            # Albumentations 2.0.x: Affine ใช้ fill แทน cval, ไม่ใช้ mode
+            A.Affine(
+                translate_percent={"x": (-0.05, 0.05), "y": (-0.05, 0.05)},
+                scale=(0.90, 1.10),
+                rotate=(-10, 10),
+                fill=0,             # แทน cval (API ใหม่)
                 p=0.5,
             ),
             # Intensity augmentation (simulate different exposure)
@@ -214,16 +215,12 @@ class CheXpertDataModule(pl.LightningDataModule):
             A.GaussianBlur(blur_limit=3, p=0.1),
             A.GaussNoise(p=0.1),
             # CoarseDropout — บังคับโมเดลไม่ให้จำ support devices (สาย/อุปกรณ์)
-            # สุ่มเจาะช่องสี่เหลี่ยมดำบนภาพ → โมเดลต้องดูเนื้อเยื่อปอดจริงๆ แทน
             A.CoarseDropout(
-                max_holes=8,       # สูงสุด 8 ช่อง
-                max_height=32,     # สูงสุด 32px (~8% ของ 384)
-                max_width=32,
-                min_holes=2,       # อย่างน้อย 2 ช่อง
-                min_height=8,
-                min_width=8,
-                fill_value=0,      # เติมสีดำ (สอดคล้องกับ background X-ray)
-                p=0.3,             # ใช้ 30% ของ batch ไม่ aggressive เกินไป
+                num_holes_range=(2, 8),
+                hole_height_range=(8, 32),
+                hole_width_range=(8, 32),
+                fill=0,
+                p=0.3,
             ),
             # Normalize ด้วย ImageNet stats (ใช้กับ pretrained model)
             A.Normalize(mean=IMAGENET_MEAN, std=IMAGENET_STD),

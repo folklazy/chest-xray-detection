@@ -1,9 +1,11 @@
 """
 Train DenseNet121 on CheXpert Small
 
-Steps ก่อน run:
-    1. python utils/calc_pos_weight.py   ← ดู POS_WEIGHT ที่ถูกต้อง
-    2. python scripts/train_densenet121.py
+การแก้ไขจาก training run แรก:
+  - LR: 1e-4 -> 3e-5  (แก้ train_loss ที่ขึ้นแทนลง)
+  - Scheduler: ReduceLROnPlateau -> CosineAnnealingLR + Warmup
+  - warmup_epochs=1 (ป้องกัน gradient explosion ช่วงแรก)
+  - แก้ albumentations warnings (ShiftScaleRotate, CoarseDropout)
 """
 import sys
 from pathlib import Path
@@ -25,14 +27,14 @@ DATA_DIR    = "./data"
 CSV_PATH    = "./data/CheXpert-v1.0-small/train.csv"
 
 MODEL_NAME  = "densenet121"
-IMG_SIZE    = 384       # เพิ่มจาก 320 → 384 (paper ใช้ 320 แต่ 384 ให้ AUC ดีกว่า)
+IMG_SIZE    = 384
 BATCH_SIZE  = 16
 NUM_WORKERS = 8
-LR          = 1e-4
-EPOCHS      = 10        # เพิ่มจาก 8 → 10 (DenseNet เรียนรู้ช้ากว่า ViT)
+EPOCHS      = 10
+WARMUP      = 1
 
-# ⚠️  รัน utils/calc_pos_weight.py ก่อนเพื่อให้ได้ค่าจริง
-# ค่านี้คำนวณจาก frontal-only + custom policy
+LR          = 3e-5      # ลดจาก 1e-4 แก้ train_loss ขึ้น
+
 POS_WEIGHT  = [2.21, 7.19, 11.84, 2.1, 1.21]
 
 # =====================================================
@@ -40,7 +42,7 @@ POS_WEIGHT  = [2.21, 7.19, 11.84, 2.1, 1.21]
 def main():
     pl.seed_everything(42, workers=True)
     torch.set_float32_matmul_precision("medium")
-    torch.backends.cudnn.benchmark = True   # เร็วขึ้นเมื่อ input size คงที่
+    torch.backends.cudnn.benchmark = True
 
     dm = CheXpertDataModule(
         data_dir=DATA_DIR,
@@ -50,7 +52,7 @@ def main():
         num_workers=NUM_WORKERS,
         policy="custom",
         frontal_only=True,
-        use_clahe=True,     # เพิ่ม CLAHE → +1-2% AUC
+        use_clahe=True,
     )
 
     model = CheXpertLightning(
@@ -60,21 +62,23 @@ def main():
         lr=LR,
         pos_weight=POS_WEIGHT,
         scheduler_monitor="val_auc",
+        epochs=EPOCHS,
+        warmup_epochs=WARMUP,
     )
 
-    exp_name = f"{MODEL_NAME}_img{IMG_SIZE}_bs{BATCH_SIZE}_clahe_e{EPOCHS}"
+    exp_name = f"{MODEL_NAME}_img{IMG_SIZE}_bs{BATCH_SIZE}_lr{LR}_cosine_e{EPOCHS}"
     logger = TensorBoardLogger("logs", name="chexpert", version=exp_name)
 
     ckpt = ModelCheckpoint(
         monitor="val_auc",
         mode="max",
-        save_top_k=3,       # เก็บ top-3 ไว้ ensemble ทีหลัง
+        save_top_k=3,
         filename="best-{epoch:02d}-{val_auc:.4f}",
     )
     es = EarlyStopping(
         monitor="val_auc",
         mode="max",
-        patience=4,         # เพิ่มจาก 3 → 4 (ให้โอกาส LR decay ทำงาน)
+        patience=5,
         min_delta=0.001,
     )
     lrmon = LearningRateMonitor(logging_interval="epoch")
@@ -88,13 +92,11 @@ def main():
         callbacks=[ckpt, es, lrmon],
         log_every_n_steps=20,
         gradient_clip_val=1.0,
-        # ไม่ใช้ accumulate_grad_batches สำหรับ DenseNet
-        # (bs=16 พอแล้ว)
     )
 
     trainer.fit(model, dm)
-    print(f"\n✅ Best checkpoint: {ckpt.best_model_path}")
-    print(f"   Best val_auc:    {ckpt.best_model_score:.4f}")
+    print(f"\nBest checkpoint: {ckpt.best_model_path}")
+    print(f"Best val_auc:    {ckpt.best_model_score:.4f}")
 
 
 if __name__ == "__main__":
